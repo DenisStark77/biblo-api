@@ -1,0 +1,108 @@
+swagger: '2.0'
+info:
+  title: Biblosphere API
+  description: API for bookshelf recognition
+  version: 1.0.0
+host: biblosphere-api-ihj6i2l2aq-uc.a.run.app
+schemes:
+  - https
+produces:
+  - application/json
+security:
+  - firebase: []
+  - google_id_token: []
+paths:
+  /add:
+    post:
+      summary: Add books to the Bibloshere catalogue
+      consumes:
+        - application/json
+      parameters:
+        - in: body
+          name: books
+          description: List of books to add.
+          schema:
+            $ref: ''#/definitions/BookList'
+      operationId: add
+      x-google-backend:
+        address: https://us-central1-biblosphere-210106.cloudfunctions.net/add_books
+        protocol: h2
+      responses:
+        '200':
+          description: A successful response
+          schema:
+            type: string
+  /search:
+    get:
+      summary: Search book in Biblosphere catalogue by the title/author
+      consumes:
+        - application/json
+      parameters:
+        - in: query
+          name: q
+          type: string
+          description: The line with author/title/isbn
+      operationId: search
+      x-google-backend:
+        address: https://us-central1-biblosphere-210106.cloudfunctions.net/search_book
+        protocol: h2
+      responses:
+        '200':
+          description: A successful response
+          schema:
+            $ref: ''#/definitions/BookList'
+  /recognize:
+    get:
+      summary: Recognize image with books and return list of books
+      consumes:
+        - application/json
+      parameters:
+        - in: query
+          name: uri
+          type: string
+          description: The GCS path to the image
+      operationId: recognize
+      x-google-backend:
+        address: https://us-central1-biblosphere-210106.cloudfunctions.net/recognize_shelf
+        protocol: h2
+      responses:
+        '200':
+          description: A successful response
+          schema:
+            $ref: ''#/definitions/BookList'
+definitions:
+    BookList:
+      type: array
+      items:
+        type: object
+        required:
+          - isbn
+        properties:
+          isbn:
+            type: string
+          title:
+            type: string
+          authors:
+            type: string
+          image:
+            type: string
+          language:
+            type: string
+          categories:
+            type: string
+securityDefinitions:
+    firebase:
+      authorizationUrl: ""
+      flow: "implicit"
+      type: "oauth2"
+      x-google-issuer: "https://securetoken.google.com/biblosphere-210106"
+      x-google-jwks_uri: "https://www.googleapis.com/service_accounts/v1/metadata/x509/securetoken@system.gserviceaccount.com"
+      x-google-audiences: "biblosphere-210106"
+    google_id_token:
+      authorizationUrl: ""
+      flow: "implicit"
+      type: "oauth2"
+      x-google-issuer: "https://accounts.google.com"
+      x-google-jwks_uri: "https://www.googleapis.com/oauth2/v3/certs"
+      # Optional. Replace YOUR-CLIENT-ID with your client ID
+      x-google-audiences: "32555940559.apps.googleusercontent.com"

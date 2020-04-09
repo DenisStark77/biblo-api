@@ -1,0 +1,13 @@
+pandas
+numpy
+opencv-python
+mysql-connector-python
+beautifulsoup4
+requests
+google-cloud-storage
+google-cloud-vision
+fuzzywuzzy
+python-Levenshtein
+gcsfs
+flask
+firebase_admin
