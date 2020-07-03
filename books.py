@@ -2,13 +2,34 @@ import re
 
 from tools import lexems
 
+
 class Book:
-    def __init__(self, isbn, title, authors, image=''):
+    def __init__(self, isbn, title, authors, image='', language=None, cover_text=None, \
+                 back_text=None, tags=None, genre=None, description=None):
         self.isbn = isbn
         self.title = title
         self.authors = authors
         self.image = image
+        if language is not None:
+            self.language = language
+        if cover_text is not None:
+            self.cover_text = cover_text
+        if back_text is not None:
+            self.back_text = back_text
+        if tags is not None:
+            self.tags = tags
+        if genre is not None:
+            self.genre = genre
+        if description is not None:
+            self.description = description
         self.keys = lexems(title + ' ' + authors, full=True)
+
+    @classmethod
+    def from_json(cls, obj):
+        return cls(obj['isbn'], obj['title'], obj['authors'], obj['image'])
+
+    def catalog_title(self):
+        return self.title + ' ' + self.authors
 
 # Check if two strings are the same book title
 def is_same_book(catalog_title, bookspine, top=5, trace=False):
@@ -21,7 +42,7 @@ def is_same_book(catalog_title, bookspine, top=5, trace=False):
         print('Matches (%d), Permutations (%d), Insertions (%d), Deletions (%d):' % (m, p, i, d))
 
     # TODO: Euristic criteria. Needs to improve
-    # top: give +1 score if it only one book in a toop list in DB
+    # top: give +1 score if it only one book in a top list in DB
     return m >= 3 and p <= 3 and i <= 3 and m - p/2 - i/3 + (5-top)/4 > 2 or \
         m >= 2 and p == 0 and i == 0 and d <= 1
 

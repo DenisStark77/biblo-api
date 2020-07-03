@@ -1,18 +1,213 @@
-import numpy as np
 import re
+import os
 import cv2
+import traceback
+import numpy as np
 import mysql.connector
+from math import pi, sin, cos, atan2, sqrt
 from fuzzywuzzy import process, fuzz
-from google.cloud import storage
-from flask import jsonify, abort
+from google.cloud import storage, pubsub, exceptions
+from flask import jsonify, abort, json
 from functools import wraps
+from collections import Counter
 
 from tools import imread_blob, ocr_url, ocr_image, convex_for_points, line_angle, distance_to_line, d, \
     center_for_points, box_angle, box_for_words, lexems, lexem, rotate_points, diff_angle, \
     is_overlap, minrect_area, in_section, rotate
 from books import is_same_book, has_cyrillic, Book
-from catalog import find_book, add_book
-from scrappers import lookup_ozon, lookup_abebooks
+from catalog import find_book, add_book_sql, get_book_sql, lang_codes, get_tag_list
+from scrappers import lookup_ozon, lookup_abebooks, search_google_by_isbn, search_rsl_by_isbn, \
+    search_google_by_titleauthor, search_rsl_by_titleauthor
+
+import firebase_admin
+from firebase_admin import credentials
+from firebase_admin import firestore
+from firebase_admin import messaging
+
+
+# Use the application default credentials
+# TODO: Only initialize it for add_user_books(_from_image_sub) functions which use Firestore (Performance)
+cred = credentials.ApplicationDefault()
+firebase_admin.initialize_app(cred, {
+  'projectId': 'biblosphere-210106',
+})
+db = firestore.client()
+
+# TODO: Get the client only in function which needs it. Make empty global variable and check it (Performance)
+publisher = pubsub.PublisherClient()
+
+
+# Function to send FCM notification message for new chat message
+# Deploy with:
+# gcloud functions deploy send_notification --runtime python37 --trigger-event providers/cloud.firestore/eventTypes/document.create --trigger-resource 'projects/biblosphere-210106/databases/(default)/documents/messages/{chatId}/{chatCollectionId}/{msgId}'
+# gcloud functions logs read send_notification
+def send_notification(data, context):
+    path_parts = context.resource.split('/documents/')[1].split('/')
+    collection_path = path_parts[0]
+    document_path = '/'.join(path_parts[1:])
+    chat_id = path_parts[1]
+
+    #print('!!!DEBUG: Chat id: ', chat_id)
+    #print('!!!DEBUG: Message path: ', collection_path, document_path)
+
+    message = db.collection(collection_path).document(document_path).get().to_dict()
+    user_to = db.collection('users').document(message['idTo']).get().to_dict()
+    user_from = db.collection('users').document(message['idFrom']).get().to_dict()
+
+    notification = messaging.Message(
+        token=user_to['token'],
+        notification=messaging.Notification(
+            title='Chat message',
+            body='Message from ' + user_from['name']
+        ),
+        data={
+            'click_action': 'FLUTTER_NOTIFICATION_CLICK',
+            'event': 'new_message',
+            'chat': chat_id,
+        })
+
+    response = messaging.send(notification)
+    # Response is a message ID string.
+    print('Successfully sent message:', response)
+
+
+# Function to calculate chat id from user ids
+def get_chat_id(from_id, to_id):
+    return ':'.join(sorted([from_id, to_id]))
+
+
+# Function to calculate distance between two geo-points
+def distance_between(p1, p2):
+    lat1, lon1 = p1.latitude, p1.longitude
+    lat2, lon2 = p2.latitude, p2.longitude
+
+    r = 6378.137 # Radius of earth in KM
+    d_lat = lat2 * pi / 180 - lat1 * pi / 180
+    d_lon = lon2 * pi / 180 - lon1 * pi / 180
+    a = sin(d_lat/2) * sin(d_lat/2) + cos(lat1*pi/180) * cos(lat2*pi/180) * sin(d_lon/2) * sin(d_lon/2)
+    c = 2 * atan2(sqrt(a), sqrt(1 - a))
+    distance = r * c
+
+    return distance / 1000
+
+
+# Function to match book with wish and send personal message
+# Deploy with:
+# gcloud functions deploy ask_book --runtime python37 --memory=256MB --timeout=300s --trigger-event providers/cloud.firestore/eventTypes/document.create --trigger-resource 'projects/biblosphere-210106/databases/(default)/documents/bookrecords/{bookId}'
+# gcloud functions logs read ask_book
+def ask_book(data1, context):
+    try:
+        path_parts = context.resource.split('/documents/')[1].split('/')
+        book_id = path_parts[1]
+
+        data = db.collection('bookrecords').document(book_id).get().to_dict()
+
+        if data['ownerId'] != 'oyYUDByQGVdgP13T1nyArhyFkct1':
+            return
+
+        # Look for the book matching the wish or wish matching the book
+        query_snapshot = db.collection('bookrecords').where('isbn', '==', data['isbn']) \
+            .where('wish', '==', not data['wish']) \
+            .limit(10) \
+            .stream()
+
+        matches = [doc.to_dict() for doc in query_snapshot]
+
+        # Skip the rest if matches not found
+        if len(matches) == 0:
+            return
+
+        match = None
+        if data['location'] is not None:
+            # Find the closest one
+            min_distance = 100000
+            for b in matches:
+                if b['location'] is not None:
+                    distance = distance_between(data['location']['geopoint'], b['location']['geopoint'])
+                    if distance < min_distance:
+                        min_distance = distance
+                        match = b
+
+        if match is None:
+            print('Geo-information is not available, use a random match')
+            match = matches[0]
+
+        print('Match found:', match['id'], match['ownerId'])
+
+        if data['wish']:
+            user_from, user_to = data['holderId'], match['holderId']
+            wish, book = data, match
+        else:
+            user_to, user_from = data['holderId'], match['holderId']
+            wish, book = match, data
+
+        # Prepare data for the message
+        chat_id = get_chat_id(book['holderId'], wish['ownerId'])
+
+        db.collection('messages').document(chat_id).collection(chat_id).document().set(
+            {
+                'content': 'Hello, you have a book "%s", which I wish to read' % (book['title']),
+                'type': 0,
+                'attachment': 'Bookrecord',
+                'id': book['id'],
+                'image': book['image'],
+                'bot': True,
+                'language': 'en',
+                'idFrom': user_from,
+                'idTo': user_to,
+                'timestamp': firestore.SERVER_TIMESTAMP
+            }
+        )
+    except Exception as e:
+        print('Exception for book [%s]' % book['id'], e)
+        traceback.print_exc()
+
+
+def json_abort(status_code, message):
+    data = {
+        'error': {
+            'code': status_code,
+            'message': message
+        }
+    }
+    response = jsonify(data)
+    response.status_code = status_code
+    abort(response)
+
+
+# Class to encode class objects to JSON
+class JsonEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, Book):
+            data = obj.__dict__
+            data['_type'] = 'Book'
+            return data
+        elif isinstance(obj, Block):
+            return {
+                '_type': 'Block',
+                'bookspine': obj.bookspine,
+                'book': obj.book,
+                'outline': obj.box,
+            }
+        return json.JSONEncoder.default(self, obj)
+
+
+# Class to decode JSON to class objects
+class JsonDecoder(json.JSONDecoder):
+    def __init__(self, *args, **kwargs):
+        json.JSONDecoder.__init__(self, object_hook=self.object_hook, *args, **kwargs)
+
+    def object_hook(self, obj):
+        if '_type' not in obj:
+            return obj
+        type = obj['_type']
+        if type == 'Book':
+            return Book.from_json(obj)
+        elif type == 'Block':
+            return Block.from_json(obj)
+
 
 # Wrapper for MySQL connection
 def connect_mysql(f):
@@ -39,18 +234,45 @@ def connect_mysql(f):
     return wrapper
 
 
+# Wrapper for MySQL connection
+def connect_mysql_pubsub(f):
+    @wraps(f)
+    def wrapper(event, context):
+        try:
+            cnx = mysql.connector.connect(user='biblosphere', password='biblosphere',
+                                          unix_socket='/cloudsql/biblosphere-210106:us-central1:biblosphere',
+                                          database='biblosphere',
+                                          use_pure=False)
+
+            cnx.autocommit = True
+            cursor = cnx.cursor(prepared=True)
+        except Exception as e: # MySQL error
+            print("MySQL connection failed")
+            json_abort(401, message="MySQL connection failed")
+
+        result = f(event, context, cursor)
+        cursor.close()
+        cnx.close()
+
+        return result
+
+    return wrapper
+
+
 # HTTP API function to add books
 # gcloud functions deploy add_books --runtime python37 --trigger-http --allow-unauthenticated --memory=256MB --timeout=300s
-# gcloud auth print-identity-token
 # gcloud functions logs read add_books
 @connect_mysql
 def add_books(request, cursor):
-    books = request.get_json(silent=True)
+    body = request.get_json(silent=True)
 
-    if books is None:
+    if body['books'] is None:
         json_abort(400, message="Missing list of books")
 
-    for b in books:
+    print('Request body:', body)
+    print('Request books:', body['books'])
+
+    for b in body['books']:
         if 'isbn' not in b:
             print('Isbn missing for', b)
             continue
@@ -58,10 +280,89 @@ def add_books(request, cursor):
         book = Book(b['isbn'], b['title'], b['authors'], b['image'])
         print('Path', book.isbn, book.title, book.authors, book.image)
 
-        add_book(cursor, book)
+        add_book_sql(cursor, book)
         print('Book added to MySQL', book.isbn, book.title, book.authors)
 
     return 'Success'
+
+
+# HTTP API function to get book by ISBN
+# gcloud functions deploy get_tags --runtime python37 --trigger-http --allow-unauthenticated --memory=256MB --timeout=10s
+# gcloud functions logs read get_tags
+@connect_mysql
+def get_tags(request, cursor):
+    query = None
+    try:
+        req_json = request.get_json(silent=True)
+        req_args = request.args
+
+        if req_args is not None and 'query' in req_args:
+            query = req_args['query']
+        elif req_json is not None and 'query' in req_json:
+            isbn = req_json['query']
+        else:
+            json_abort(400, message="Missing [query] parameter")
+
+        print('Query', query)
+
+        if len(query) >= 2:
+            # Search book in Biblosphere
+            tags = get_tag_list(cursor, query, trace=False)
+            return json.dumps(tags, cls=JsonEncoder)
+        else:
+            return []
+
+    except Exception as e:
+        print('Exception for tag query [%s]' % query, e)
+        traceback.print_exc()
+        return json_abort(400, message="%s" % e)
+
+
+# HTTP API function to get book by ISBN
+# gcloud functions deploy get_book --runtime python37 --trigger-http --allow-unauthenticated --memory=256MB --timeout=30s
+# gcloud functions logs read get_book
+@connect_mysql
+def get_book(request, cursor):
+    try:
+        req_json = request.get_json(silent=True)
+        req_args = request.args
+
+        if req_args is not None and 'isbn' in req_args:
+            isbn = req_args['isbn']
+        elif req_json is not None and 'isbn' in req_json:
+            isbn = req_json['isbn']
+        else:
+            json_abort(400, message="Missing [isbn] parameter")
+
+        print('ISBN', isbn)
+
+        # Search book in Biblosphere
+        book = get_book_sql(cursor, isbn, trace=False)
+
+        # If not found in Biblosphere search in Google Books
+        if book is None:
+            book = search_google_by_isbn(isbn, cursor, trace=False)
+
+        # If not found in Biblosphere and Google search in RSL and Abebook
+        if book is None and isbn.startswith('9785'):
+            # If russian ISBN search in RSL
+            book = search_rsl_by_isbn(isbn, cursor, trace=False)
+
+        if book is None:
+            # If RSL fails or not cyrillic -> search in Abebooks
+            book, match = lookup_abebooks('', cursor, isbn=isbn, trace=False)
+
+        books = []
+        if book is not None:
+            books = [book]
+
+        return json.dumps(books, cls=JsonEncoder)
+
+    except Exception as e:
+        print('Exception for book [%s]' % book['id'], e)
+        traceback.print_exc()
+        return json_abort(400, message="%s" % e)
+
 
 
 # HTTP API function to search book
@@ -80,109 +381,416 @@ def search_book(request, cursor):
     else:
         json_abort(400, message="Missing [q] parameter")
 
-    print('Query', text)
+    #print('Query', text)
+    keys = lexems(text)
 
-    _, books = find_book(cursor, lexems(text))
-    books = [b.__dict__ for b in books]
+    # Search book in Biblosphere
+    _, books = find_book(cursor, keys)
 
-    return jsonify(books)
+    # Filter results if number of key words to search more than 2
+    if len(keys) > 2:
+        books = [b for b in books if is_same_book(b.catalog_title(), text)]
 
+    # If not found in Biblosphere search in APIs and web
+    if len(books) == 0:
+        books = search_google_by_titleauthor(text, cursor, trace=False)
 
-# HTTP API function to recognize shelf
-# gcloud functions deploy recognize_shelf --runtime python37 --trigger-http --allow-unauthenticated --memory=1024MB --timeout=300s
-# gcloud auth print-identity-token
-# gcloud functions logs read recognize_shelf
-@connect_mysql
-def recognize_shelf(request, cursor):
-    request_args = request.args
+        if (books is None or len(books) == 0) and has_cyrillic(text):
+            # If cyrillic symbols search in RSL
+            books = search_rsl_by_titleauthor(text, cursor, trace=False)
 
-    if request_args is None or 'uri' not in request_args:
-        json_abort(400, message="Missing [uri] parameter")
+        if (books is None or len(books) == 0):
+            # If not cyrillic search in google books API, Goodreads and Abebooks
+            book, match = lookup_abebooks(text, cursor, trace=False)
+            books = [book]
 
-    path = request_args['uri']
-    print('Path', path)
+        # Filter books if more than 3 key words given
+        if len(keys) > 2 and books is not None and len(books) > 0:
+            books = [b for b in books if is_same_book(b.catalog_title(), text)]
 
-    blocks, _, _ = recognize_shelf_int(path, cursor)
-    books = [b.book.__dict__ for b in blocks if b.book is not None]
-
-    return jsonify(books)
-
-
-def json_abort(status_code, message):
-    data = {
-        'error': {
-            'code': status_code,
-            'message': message
-        }
-    }
-    response = jsonify(data)
-    response.status_code = status_code
-    abort(response)
+    return json.dumps(books, cls=JsonEncoder)
 
 
-# Function to recognize bookshelf and return list of books
-def recognize_shelf_int(filename, cursor, trace=False):
-    client = storage.Client()
-    bucket = client.get_bucket('biblosphere-210106.appspot.com')
+# HTTP API function to add books to user library from bookshelf image (Asynchronous)
+# gcloud functions deploy add_user_books_from_image --runtime python37 --trigger-http --allow-unauthenticated --memory=256MB --timeout=30s
+# gcloud functions logs read add_user_books_from_image
+def add_user_books_from_image(request):
+    params = request.get_json(silent=True)
 
-    b = bucket.blob(filename)
-    img = imread_blob(b)
-    response = ocr_url('gs://biblosphere-210106.appspot.com/' + b.name)
+    if params is None:
+        json_abort(400, message="Missing input parameters")
 
-    # Enable profiler
-    # pr.enable()
+    # TODO: Validate parameters: uid, uri, location
+    # Call Pub/Sub function to recognize image and add books to the user library
 
-    # cnx = mysql.connector.connect(user='biblosphere', password='biblosphere',
-    #                              host='127.0.0.1',
-    #                              database='biblosphere',
-    #                              use_pure=False)
+    topic = 'projects/biblosphere-210106/topics/add_user_books_from_image'
+    publisher.publish(topic, json.dumps(params).encode('utf8'))
 
-    # Extract blocks from Google Cloud Vision responce
-    blocks, w_other, max_height = extract_blocks(response, img, trace=False)
+    return 'Image recognition requested'
 
-    if max_height is None:
-        max_height = img.shape[0] / 3
 
-    # Merge neaby blocks along the same bookspine (by angle, distance and size)
-    confident_blocks = merge_bookspines(blocks, w_other, max_height, img, trace=False)
+# Function to add books to the user library
+# gcloud functions deploy add_user_books --runtime python37 --trigger-http --allow-unauthenticated --memory=256MB --timeout=30s
+# gcloud functions logs read add_user_books
+def add_user_books(request, cursor):
+    params = request.get_json(silent=True)
 
-    # Merge cross lines
-    merge_along_confident(blocks, confident_blocks, w_other, img, trace=False)
+    if params is None:
+        json_abort(400, message="Missing input parameters")
 
-    # Search for books (as new words matched to the blocks search might be different)
-    lookup_books(cursor, blocks, confident_blocks, trace=False)
+    #TODO: Add books to Firestore for a user
 
-    # Merge smaller blocks with text not in the title/author (usually publisher)
-    merge_publisher(blocks, confident_blocks, w_other, img, trace=False)
+    return 'Books added to user library'
 
-    # Assume corrupted blocks are scanned up-side-down. Recognize again.
-    rotate_corrupted(cursor, blocks, confident_blocks, w_other, img, trace=False)
 
-    # Stitch fragments of the same book (if same book is cut to two blocks)
-    merge_book_fragments(blocks, confident_blocks, img, trace=False)
+# Extract blocks from book cover recognition response
+def read_text(response, trace=False):
+    # blocks = []
+    # for p in response.full_text_annotation.pages:
+    #    for b in p.blocks:
+    #        words = []
+    #        for par in b.paragraphs:
+    #            for w in par.words:
+    #                word = ''.join([s.text for s in w.symbols])
+    #                words.append(word)
 
-    # Identify unknown books (look for false positives)
-    unknown_blocks = list_unknown(cursor, blocks, trace=True)
+    #        if len(words) > 0:
+    #            blocks.append(' '.join(words))
+    # return '\n'.join(blocks)
 
-    # Clean noise
-    remove_noise(blocks, confident_blocks, unknown_blocks, threshold=0.50, trace=False)
+    texts = response.text_annotations
 
-    confident_blocks = list(set([b for b in blocks if b.book is not None]))
-    unknown_blocks = list(set([b for b in blocks if b.book is None]))
+    if texts is not None and len(texts) > 0:
+        locale = texts[0].locale
+        print('Locale:', locale)
 
-    # Disable profiler
-    # pr.disable()
+        if locale in lang_codes:
+            lang = lang_codes[locale]
+        else:
+            lang = None
 
-    #if trace:
-    #    for b in confident_blocks:
-    #        cv2.drawContours(img, [np.array(b.box)], 0, (0, 255, 0), img.shape[0] // 300)
-    #        print('Book found for:', b.bookspine)
-    #        print('>', b.book.authors, b.book.title)
-    #    for b in unknown_blocks:
-    #        cv2.drawContours(img, [np.array(b.box)], 0, (0, 0, 255), img.shape[0] // 300)
-    #    plot_img(img, show=True)
+        text = texts[0].description
 
-    return confident_blocks, unknown_blocks, img
+        # Replace CRLF with space to make it easy to edit
+        text = text.replace('\n', ' ')
+
+        print(text)
+
+        return lang, text
+    else:
+        return None, None
+
+
+# HTTP API function to add book cover to GCS. It resize original cover and do OCR if requested.
+# gcloud functions deploy add_cover --runtime python37 --trigger-http --allow-unauthenticated --memory=256MB --timeout=55s
+# gcloud functions logs read add_cover
+def add_cover(request):
+    isbn = ''
+    try:
+        params = request.get_json(silent=True)
+
+        if params is None:
+            json_abort(400, message="Missing input parameters")
+
+        # Validate params
+        if 'uri' not in params or 'uid' not in params or 'isbn' not in params :
+            # TODO: Make proper error handling
+            print('ERROR: uri/uid/isbn parameters missing.')
+            return 'uri/uid/isbn parameters missing.'
+
+        print('!!!DEBUG input parameters:', params)
+
+        filename = params['uri']
+        uid = params['uid']
+        isbn = params['isbn']
+        ocr = 'ocr' in params and params['ocr']
+
+        client = storage.Client()
+        bucket = client.get_bucket('biblosphere-210106.appspot.com')
+        blob = bucket.blob(filename)
+
+        # Do OCR if requested
+        cover_text = None
+        locale = None
+        if ocr:
+            response = ocr_url('gs://biblosphere-210106.appspot.com/' + blob.name)
+            lang, cover_text = read_text(response)
+
+        # Resize image (to the width 300)
+        img = imread_blob(blob)
+        scale_percent = 300.0/img.shape[1]
+        width = int(img.shape[1] * scale_percent)
+        height = int(img.shape[0] * scale_percent)
+        img_res = cv2.resize(img, (width, height))
+
+        # Upload resized image to GCS
+        cover_file = 'covers/'+isbn+'.jpg'
+        blob = bucket.blob(cover_file)
+        res, data = cv2.imencode('.jpg', img_res)
+        blob.upload_from_string(bytes(data), 'image/jpeg')
+        blob.make_public()
+
+        # Return book with cover image, isbn and cover text (if any)
+        book = Book(isbn, '', '', image=blob.public_url, cover_text=cover_text, language=lang)
+
+        return json.dumps([book], cls=JsonEncoder)
+
+    except Exception as e:
+        print('Exception for book [%s]' % isbn, e)
+        traceback.print_exc()
+        return json_abort(400, message="%s" % e)
+
+
+# HTTP API function to add book cover to GCS. It resize original cover and do OCR if requested.
+# gcloud functions deploy add_back --runtime python37 --trigger-http --allow-unauthenticated --memory=256MB --timeout=55s
+# gcloud functions logs read add_back
+def add_back(request):
+    isbn = ''
+    try:
+        params = request.get_json(silent=True)
+
+        if params is None:
+            json_abort(400, message="Missing input parameters")
+
+        # Validate params
+        if 'uri' not in params or 'uid' not in params or 'isbn' not in params :
+            # TODO: Make proper error handling
+            print('ERROR: uri/uid/isbn parameters missing.')
+            return 'uri/uid/isbn parameters missing.'
+
+        print('!!!DEBUG input parameters:', params)
+
+        filename = params['uri']
+        uid = params['uid']
+        isbn = params['isbn']
+        ocr = 'ocr' in params and params['ocr']
+
+        client = storage.Client()
+        bucket = client.get_bucket('biblosphere-210106.appspot.com')
+        blob = bucket.blob(filename)
+
+        # Do OCR if requested
+        back_text = None
+        if ocr:
+            response = ocr_url('gs://biblosphere-210106.appspot.com/' + blob.name)
+            lang, back_text = read_text(response)
+
+        # Return book with cover image, isbn and cover text (if any)
+        book = Book(isbn, '', '', back_text=back_text, language=lang)
+
+        return json.dumps([book], cls=JsonEncoder)
+
+    except Exception as e:
+        print('Exception for book [%s]' % isbn, e)
+        traceback.print_exc()
+        return json_abort(400, message="%s" % e)
+
+
+class RecognitionStatus:
+    none, upload, scan, outline, catalogs_lookup, rescan, completed, failed, store = range(0, 9)
+
+# Function to recognize image with bookshelf and add books to the user library
+# gcloud functions deploy add_user_books_from_image_sub --runtime python37 --trigger-topic add_user_books_from_image --allow-unauthenticated --memory=1024MB --timeout=300s
+# gcloud functions logs read add_user_books_from_image_sub
+@connect_mysql_pubsub
+def add_user_books_from_image_sub(event, context, cursor):
+    try:
+        import base64
+
+        if 'data' not in event:
+            # TODO: Make proper error handling
+            print('ERROR: parameters missing in a pubsub payload.')
+            return
+
+        params = json.loads(base64.b64decode(event['data']).decode('utf-8'))
+
+        if 'uri' not in params or 'uid' not in params:
+            # TODO: Make proper error handling
+            print('ERROR: uri/uid parameters missing.')
+            return
+
+        print('!!!DEBUG input parameters:', params)
+
+        filename = params['uri']
+        uid = params['uid']
+        shelf_id = params['shelf']
+        notification = True
+        if 'notification' in params:
+            notification = params['notification']
+
+        trace = False
+        if 'trace' in params:
+            trace = params['trace']
+
+        print('!!!DEBUG Notification:', notification)
+        print('Firebase userid:', uid)
+        location = None
+        if 'location' in params:
+            location = {'geohash': params['location']['geohash'], 'geopoint': firestore.GeoPoint(params['location']['lat'], params['location']['lon'])}
+
+        client = storage.Client()
+        bucket = client.get_bucket('biblosphere-210106.appspot.com')
+
+        # Check if result JSON is available
+        result_filename = os.path.splitext(filename)[0] + '.json'
+        result_blob = bucket.blob(result_filename)
+
+        # Do recognition only if no results available from previous runs
+        already_recognized = False
+        if not result_blob.exists():
+            b = bucket.blob(filename)
+            img = imread_blob(b)
+            response = ocr_url('gs://biblosphere-210106.appspot.com/' + b.name)
+
+            db.collection('shelves').document(shelf_id).set({
+                'id': shelf_id,
+                'image': filename,
+                'userId': uid,
+                'status': RecognitionStatus.outline,
+                #'started': firestore.SERVER_TIMESTAMP not to override existing one
+              }, merge=True)
+
+            # Enable profiler
+            # pr.enable()
+
+            # cnx = mysql.connector.connect(user='biblosphere', password='biblosphere',
+            #                              host='127.0.0.1',
+            #                              database='biblosphere',
+            #                              use_pure=False)
+
+            # Extract blocks from Google Cloud Vision responce
+            blocks, w_other, max_height = extract_blocks(response, img, trace=trace)
+
+            if max_height is None:
+                max_height = img.shape[0] / 3
+
+            # Merge neaby blocks along the same bookspine (by angle, distance and size)
+            confident_blocks = merge_bookspines(blocks, w_other, max_height, img, trace=trace)
+
+            # Merge cross lines
+            merge_along_confident(blocks, confident_blocks, w_other, img, trace=trace)
+
+            db.collection('shelves').document(shelf_id).update({'status': RecognitionStatus.catalogs_lookup})
+
+            # Search for books (as new words matched to the blocks search might be different)
+            lookup_books(cursor, blocks, confident_blocks, trace=trace)
+
+            # Merge smaller blocks with text not in the title/author (usually publisher)
+            merge_publisher(blocks, confident_blocks, w_other, img, trace=trace)
+
+            db.collection('shelves').document(shelf_id).update({'status': RecognitionStatus.rescan})
+
+            # Assume corrupted blocks are scanned up-side-down. Recognize again.
+            rotate_corrupted(cursor, blocks, confident_blocks, w_other, img, trace=trace)
+
+            db.collection('shelves').document(shelf_id).update({'status': RecognitionStatus.store})
+
+            # Stitch fragments of the same book (if same book is cut to two blocks)
+            merge_book_fragments(blocks, confident_blocks, img, trace=trace)
+
+            # Identify unknown books (look for false positives)
+            unknown_blocks = list_unknown(cursor, blocks, trace=trace)
+
+            # Clean noise
+            remove_noise(blocks, confident_blocks, unknown_blocks, threshold=0.50, trace=trace)
+
+            recognized_blocks = list(set([b for b in blocks if b.book is not None]))
+            unrecognized_blocks = list(set([b for b in blocks if b.book is None and b.bookspine is not None]))
+
+            # Disable profiler
+            # pr.disable()
+
+            #if trace:
+            #    for b in confident_blocks:
+            #        cv2.drawContours(img, [np.array(b.box)], 0, (0, 255, 0), img.shape[0] // 300)
+            #        print('Book found for:', b.bookspine)
+            #        print('>', b.book.authors, b.book.title)
+            #    for b in unknown_blocks:
+            #        cv2.drawContours(img, [np.array(b.box)], 0, (0, 0, 255), img.shape[0] // 300)
+            #    plot_img(img, show=True)
+        else:
+            already_recognized = True
+            # Read JSON with results from cloud storage
+            stored_results = json.loads(result_blob.download_as_string(), cls=JsonDecoder)
+
+            recognized_blocks = stored_results['recognized']
+            unrecognized_blocks = stored_results['unrecognized']
+
+        # Add confident books to the Biblosphere user (Firestore)
+        batch = db.batch()
+
+        for b in recognized_blocks:
+            # Set the Firestore bookrecord
+            ref = db.collection('bookrecords').document(b.bookrecord_id(uid))
+            batch.set(ref, b.bookrecord_data(uid, filename, location), merge=True)
+            print(b.book.isbn, b.book.title, b.book.authors)
+            #print(b['contour'])
+
+        # Commit the batch
+        batch.commit()
+
+        # Update status to completed and keep number of recognized books
+        db.collection('shelves').document(shelf_id).update({'status': RecognitionStatus.completed,
+                                                            'total': len(recognized_blocks) + len(unrecognized_blocks),
+                                                            'recognized': len(recognized_blocks)})
+
+        # Send a notification to the user about added books (FCM)
+        print('!!!DEBUG: Books added')
+        # This registration token comes from the client FCM SDKs.
+
+        if notification and len(recognized_blocks) > 0:
+            try:
+                doc = db.collection('users').document(uid).get().to_dict()
+                print(u'User token: {}'.format(doc['token']))
+
+                # See documentation on defining a message payload.
+                message = messaging.Message(
+                    notification=messaging.Notification(
+                        title='Books recognized',
+                        body='%d books added from photo' % len(recognized_blocks)
+                    ),
+                    data={
+                        'click_action': 'FLUTTER_NOTIFICATION_CLICK',
+                        'event': 'books_recognized',
+                        'count': '%d' % len(recognized_blocks),
+                    },
+                    token=doc['token'],
+                )
+
+                # Send a message to the device corresponding to the provided
+                # registration token.
+                response = messaging.send(message)
+                # Response is a message ID string.
+                print('Successfully sent message:', response)
+
+            except exceptions.NotFound:
+                print(u'User not found %s. Notification skipped!' % uid)
+            except Exception as e:
+                print('Exception on notification, notification skipped:', type(e))
+
+        if not already_recognized:
+            # Build JSON with results of the recognition
+            # - GCS path to image
+            # - List of recognized books (isbn/title/authors, contour)
+            # - List of unrecognized books (bookspine line, contour)
+            # - Google Cloud Vision response
+
+            data = {
+                    'uid': uid,
+                    'uri': filename,
+                    'recognized': recognized_blocks,
+                    'unrecognized': unrecognized_blocks,
+                    # 'cloud_vision_response': response
+                   }
+
+            # Store JSON to GCS
+            result_blob.upload_from_string(json.dumps(data, cls=JsonEncoder).encode('utf8'), 'application/json')
+            print('!!!DEBUG: JSON with recognition results stored')
+
+    except Exception as e:
+        print(u'Exception happend: %s' % type(e))
+        print(u'Exception during image recognition: %s' % e)
+        db.collection('shelves').document(shelf_id).update({'status': RecognitionStatus.failed})
 
 
 class Line:
@@ -211,10 +819,14 @@ class Line:
         # GAP - distance between end of line and beginning of word
         # INTERVAL - distance from start of word to central line of the line
         # ALIGN - angle between line and word
-        assert abs(self.angle) <= np.pi / 4, 'Line angle outside the quadrant'
 
         angle = line_angle(word.direction[1], word.direction[0], full=True)
-        assert abs(angle) <= np.pi / 4, 'Word angle outside the quadrant'
+
+        # TODO: Resolve why word angle is outside the quadrant (assertion replaced with 'if' as a workaround)
+        #assert abs(self.angle) <= np.pi / 4, 'Line angle outside the quadrant %.2f, %.2f | Try [%s] on line [%s]' % (180 * angle / np.pi, 180 * self.angle / np.pi, word.correct, self.text())
+        #assert abs(angle) <= np.pi / 4, 'Word angle outside the quadrant %.2f, %.2f | Try [%s] on line [%s]' % (180 * angle / np.pi, 180 * self.angle / np.pi, word.correct, self.text())
+        if abs(self.angle) <= np.pi / 4 or abs(angle) <= np.pi / 4:
+            return False
 
         if trace:
             print('Try [%s] on line [%s]' % (word.correct, self.text()))
@@ -276,17 +888,29 @@ def max_block_height(boxes):
 
 
 class Block(Box):
-    def __init__(self, words):
+    def __init__(self, words=None, book=None, bookspine=None, box=None):
         self.matches = set()
         self.unmatched = set()
-        self.book = None
+        self.book = book
         self.keys = set()
-        self.unmatched = set(words)
+        if words is not None:
+            self.unmatched = set(words)
+        else:
+            self.unmatched = set()
         # Arranged bookspine text and it's fragments
-        self.bookspine = None
+        self.bookspine = bookspine
         self.fragments = None
 
-        super().__init__(box_for_words(self.matches.union(self.unmatched)))
+        if box is not None:
+            self.box = box
+        else:
+            super().__init__(box_for_words(self.matches.union(self.unmatched)))
+
+
+    @classmethod
+    def from_json(cls, obj):
+        return cls(book=obj['book'], bookspine=obj['bookspine'], box=obj['outline'])
+
 
     def clear(self):
         self.matches = set()
@@ -450,7 +1074,7 @@ class Block(Box):
                 if corrected:
                     bookspine = self.read(trace=False)
 
-                if not is_same_book(book.title + ' ' + book.authors, bookspine, top=len(top), trace=False):
+                if not is_same_book(book.catalog_title(), bookspine, top=len(top), trace=False):
                     if trace:
                         print('BOOK DISCARDED (%s) for' % (book.title), bookspine)
                     book = None
@@ -458,11 +1082,21 @@ class Block(Box):
                     print('BOOK FOUND:', book.authors, book.title)
 
             if book is None:
-                # Search book in the web
-                if has_cyrillic(bookspine):
-                    # book = lookup_livelib(bookspine)
-                    book, match = lookup_ozon(bookspine, cursor, trace=trace)
-                else:
+                # Search in google
+                books = search_google_by_titleauthor(bookspine, cursor, trace=trace)
+                books = [b for b in books if is_same_book(b.catalog_title(), bookspine, trace=False)]
+                if books is not None and len(books) > 0:
+                    book = books[0]
+
+                if book is None and has_cyrillic(bookspine):
+                    # If cyrillic symbols search in RSL
+                    books = search_rsl_by_titleauthor(bookspine, cursor, trace=trace)
+                    books = [b for b in books if is_same_book(b.catalog_title(), bookspine, trace=False)]
+                    if books is not None and len(books) > 0:
+                        book = books[0]
+
+                if book is None:
+                    # If not cyrillic search in google books API, Goodreads and Abebooks
                     book, match = lookup_abebooks(bookspine, cursor, trace=trace)
 
                 if book is not None:
@@ -483,17 +1117,44 @@ class Block(Box):
 
                     if corrected:
                         bookspine = self.read(trace=False)
-                        match = is_same_book(book.title + ' ' + book.author, bookspine, trace=False)
+                        match = is_same_book(book.catalog_title(), bookspine, trace=False)
 
-                    if not match:
-                        book = None
-                    elif trace:
-                        print('BOOK FOUND ON WEB:', book.isbn, book.title)
+                        if not match:
+                            book = None
+                        elif trace:
+                            print('BOOK FOUND ON WEB:', book.isbn, book.title)
 
             if book is not None:
                 self.book = book
                 self.refresh_keys()
                 self.refresh_words()
+
+    def bookrecord_id(self, uid):
+        assert self.book is not None, 'Only recognized blocks can be stored in Firestore'
+        return 'b:%s:%s' % (uid, self.book.isbn)
+
+
+    def bookrecord_data(self, uid, uri, location=None):
+        assert self.book is not None, 'Only recognized blocks can be stored in Firestore'
+        return {
+                'id': self.bookrecord_id(uid),
+                'ownerId': uid,
+                'holderId': uid,
+                'users': [uid],
+                'authors': self.book.authors.split(sep=';'),
+                'title': self.book.title,
+                'isbn': self.book.isbn,
+                'image': self.book.image,
+                'confirmed': False,
+                'lent': False,
+                'matched': False,
+                'transit': False,
+                'wish': False,
+                'keys': self.book.keys,
+                'location': location,
+                #'outline': self.box.tolist(),
+                'shelf_image': uri
+               }
 
 
 # Distance from one block to another
@@ -594,7 +1255,7 @@ def rotate_and_read(block, words, angle, trace=False):
 
 
 def read_bookspine(block, threshold=0.2, trace=False):
-    words = set([w for w in block.matches.union(block.unmatched) if w.confidence > threshold])
+    words = set([w for w in block.matches.union(block.unmatched) if w.confidence > threshold and len(w.correct) >= 1])
 
     # Split all words to 4 quadrants/directions
     horizontal_left_to_right = []
@@ -635,6 +1296,7 @@ def read_bookspine(block, threshold=0.2, trace=False):
     # Loop throught each group of words
     if len(vertical_bottom_to_top) > 0:
         if trace:
+            #print('Block: %.2f [%s]' % (180 * block.angle / np.pi, ','.join(block.words())))
             print('vertical_bottom_to_top', len(vertical_bottom_to_top))
         new_fragments = rotate_and_read(block, vertical_bottom_to_top, block.angle, trace=trace)
         fragments.extend(new_fragments)

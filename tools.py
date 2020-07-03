@@ -103,7 +103,10 @@ def d(p):
 
 
 def distance_to_line(points, A, B):
-    return np.abs(np.cross(B - A, points - A) / np.linalg.norm(B - A))
+    if np.linalg.norm(B - A) == 0.0:
+        return np.sqrt(np.sum((points-A) ** 2, axis=-1))
+    else:
+        return np.abs(np.cross(B - A, points - A) / np.linalg.norm(B - A))
 
 
 # Return bounding min area box for the set of points
